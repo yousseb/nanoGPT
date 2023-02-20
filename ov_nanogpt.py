@@ -7,7 +7,6 @@ from openvino.preprocess import PrePostProcessor
 from openvino.inference_engine import IECore
 from transformers import GPT2Tokenizer
 from numba import njit
-import tiktoken
 
 
 class OVNanoGPTConfig:
@@ -15,10 +14,10 @@ class OVNanoGPTConfig:
     device: str = 'CPU'          # 'CPU', 'GPU', 'Auto', 'MULTI:GPU,CPU', 'HETERO:GPU,CPU', etc..
                                  # If you use GPU, better *not* use dynamic shape
     dynamic_shape: bool = True
-    top_k: int = 40              # Number of tokens with the highest probability which will be kept for generation
-    top_p: float = 0.5           # Maximum probability, tokens with such a probability and lower will be kept for generation
-    max_seq_len: int = 500       # Maximum sequence length for processing.
-    temperature: float = 0.3
+    top_k: int = 400             # Number of tokens with the highest probability which will be kept for generation
+    top_p: float = 0.9           # Maximum probability, tokens with such a probability and lower will be kept for generation
+    max_seq_len: int = 128       # Maximum sequence length for processing.
+    temperature: float = 0.5
     block_size: int = 2048       # If the sequence context is growing too long we must crop it at block_size
 
 
@@ -26,10 +25,9 @@ class OVNanoGPT:
     def __init__(self, config: OVNanoGPTConfig):
         self.config = config
 
-        self.enc = tiktoken.get_encoding("gpt2")
-        self.encode = lambda s: np.array(self.enc.encode(s, allowed_special={"<|endoftext|>"}))
-        self.decode = lambda l: self.enc.decode(l)
-        self.eos_token_id = self.enc.n_vocab - 1
+        # create tokenizer
+        self.tokenizer = GPT2Tokenizer.from_pretrained('gpt2')
+        self.eos_token_id = self.tokenizer.eos_token_id
         log.debug('Tokenizer configured')
 
         log.info('OpenVINO Runtime build: {}'.format(get_version()))
@@ -99,6 +97,20 @@ class OVNanoGPT:
         filtred_scores = np.ma.array(scores, mask=indices_to_remove, fill_value=filter_value).filled()
         return filtred_scores
 
+    def tokenize(self, text):
+        """
+        tokenize input text using GPT2 tokenizer
+
+        Parameters:
+          text, str - input text
+        Returns:
+          input_ids - np.array with input token ids
+          attention_mask - np.array with 0 in place, where should be padding and 1 for places where original tokens are located, represents attention mask for model
+        """
+
+        inputs = self.tokenizer(text, return_tensors="np")
+        return inputs["input_ids"], inputs["attention_mask"]
+
     # https://www.bragitoff.com/2021/12/efficient-implementation-of-softmax-activation-function-and-its-derivative-jacobian-in-python/
     @staticmethod
     @njit(cache=True, fastmath=True)  # Best implementation (VERY FAST)
@@ -149,24 +161,27 @@ class OVNanoGPT:
             return True
         return input_ids.shape[-1] >= max_length
 
-    def _generate(self, input_ids):
+    def _generate_sequence(self, input_ids):
         output_key = self.compiled_model.output(0)
 
         # maximum number of tokens that can be processed by network at once
-        input_ids = np.array([input_ids])
         while True:
             cur_input_len = len(input_ids[0])
-            model_input_ids = input_ids
+            if not self.config.dynamic_shape:
+                pad_len = self.config.max_seq_len - cur_input_len
+                model_input_ids = np.concatenate((input_ids, [[self.eos_token_id] * pad_len]), axis=-1)
+                # model_input_attention_mask = np.concatenate((attention_mask, [[0] * pad_len]), axis=-1)
+            else:
+                model_input_ids = input_ids
+                # model_input_attention_mask = attention_mask
 
             if cur_input_len > self.config.block_size:
-                model_input_ids = input_ids[:, -self.config.block_size:]
+                model_input_ids = model_input_ids[:, -self.config.block_size:]
+                # model_input_attention_mask = model_input_attention_mask[:, -self.config.block_size:]
 
-            if not self.config.dynamic_shape:
-                # pad the rest of the request
-                pad_len = self.config.max_seq_len - cur_input_len
-                model_input_ids = np.concatenate(([[self.eos_token_id] * pad_len], input_ids), axis=-1)
-
-            outputs = self.infer_request.infer({"input": model_input_ids})[output_key]
+            outputs = self.infer_request.infer({"input_ids": model_input_ids})
+                                                #"attention_mask": model_input_attention_mask})
+            outputs = outputs[output_key]
             next_token_logits = outputs[:, -1, :]
 
             # pre-process distribution
@@ -184,22 +199,38 @@ class OVNanoGPT:
             probs = self._softmax(next_token_scores)
             next_tokens = np.random.choice(probs.shape[-1], 1, p=probs[0], replace=True)
             # break the loop if max length or end of text token is reached
-            if cur_input_len == self.config.max_seq_len or next_tokens[0] == self.eos_token_id:
+            if cur_input_len == self.config.max_seq_len or next_tokens == self.eos_token_id:
                 break
             else:
                 input_ids = np.concatenate((input_ids, [next_tokens]), axis=-1)
+                # attention_mask = np.concatenate((attention_mask, [[1] * len(next_tokens)]), axis=-1)
         return input_ids
 
     def infer(self, prompt: str) -> str:
-        input_ids = self.encode(prompt)
+        input_ids, attention_mask = self.tokenize(prompt)
 
         t0 = time.perf_counter()
-        output_ids = self._generate(input_ids)
+        output_ids = self._generate_sequence(input_ids)
         t1 = time.perf_counter()
         output_text = ""
         # Convert IDs to words and make the sentence from it
-        output_text += self.decode(output_ids[0].tolist())
+        for i in output_ids[0]:
+            output_text += self.tokenizer.convert_tokens_to_string(self.tokenizer._convert_id_to_token(i))
 
         log.debug(f'OUTPUT: {output_text}')
         log.info(f'Generation took {t1 - t0:.3f} s')
         return f'{output_text}'
+
+
+if __name__ == '__main__':
+    config = OVNanoGPTConfig()
+    gpt = OVNanoGPT(config)
+
+    def prompts():
+        while True:
+            yield input('Q:')
+
+    for prompt in prompts():
+        response = gpt.infer(prompt)
+        print(f'NanoGPT: {response}\n')
+        print("-" * 70)

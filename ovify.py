@@ -10,6 +10,8 @@ from openvino.runtime import serialize
 from openvino.tools import mo
 import logging as log
 import sys
+from transformers.onnx import export, FeaturesManager
+from transformers import GPT2LMHeadModel, GPT2Tokenizer
 
 log.basicConfig(format='[ %(levelname)s ] %(message)s', level=log.INFO, stream=sys.stdout)
 
@@ -18,7 +20,7 @@ init_from = 'gpt2'  # either 'resume' (from an out_dir) or a gpt2 variant (e.g. 
 out_dir = 'out'  # ignored if init_from is not 'resume'
 start = "\n"  # or "<|endoftext|>" or etc. Can also specify a file, use as: "FILE:prompt.txt"
 num_samples = 10  # number of samples to draw
-max_new_tokens = 500  # number of tokens generated in each sample
+max_new_tokens = 1  # number of tokens generated in each sample
 temperature = 0.8  # 1.0 = no change, < 1.0 = less random, > 1.0 = more random, in predictions
 top_k = 200  # retain only the top_k most likely tokens, clamp others to have 0 probability
 seed = 1337
@@ -66,18 +68,11 @@ def pytorch_to_onnx():
     decode = lambda l: enc.decode(l)
 
     # encode the beginning of the prompt
-    if start.startswith('FILE:'):
-        with open(start[5:], 'r', encoding='utf-8') as f:
-            start = f.read()
     start_ids = encode(start)
     x = (torch.tensor(start_ids, dtype=torch.long, device=device)[None, ...])
 
-    # run generation once to ensure we're looking good.
-    with torch.no_grad():
-        with ctx:
-            y = model.generate(x, max_new_tokens, temperature=temperature, top_k=top_k)
-            # print(decode(y[0].tolist()))
-            # print('---------------')
+    model.eval()
+    print(model)
 
     # Export the model
     torch.onnx.export(model,  # model being run
@@ -86,9 +81,9 @@ def pytorch_to_onnx():
                       export_params=True,                         # store the trained parameter weights inside the model
                       opset_version=10,                           # the ONNX version to export the model to
                       do_constant_folding=True,                   # whether to execute constant folding for optimization
-                      input_names=['input'],                      # the model's input names
-                      output_names=['output'],                    # the model's output names
-                      dynamic_axes={'input':  {0: 'batch_size'},  # variable length axes
+                      input_names=['input_ids'],                  # the model's input names
+                      output_names=['output'],                             # the model's output names
+                      dynamic_axes={'input_ids':  {0: 'batch_size'},       # variable length axes
                                     'output': {0: 'batch_size'}})
 
 
@@ -98,11 +93,11 @@ def onnx_to_ir():
     global init_from
     global onnx_model_path
 
-    onnx_model = onnx.load(onnx_model_path)
-    onnx.checker.check_model(onnx_model)
+    #onnx_model = onnx.load(onnx_model_path)
+    #onnx.checker.check_model(onnx_model)
 
-    # convert model to openvino
-    ov_model = mo.convert_model(onnx_model_path, compress_to_fp16=True)
+    # # convert model to openvino
+    ov_model = mo.convert_model(onnx_model_path, compress_to_fp16=True, input='input_ids[1,1..128]')
 
     # serialize openvino model
     serialize(ov_model, str(Path(init_from).with_suffix('.xml')))
